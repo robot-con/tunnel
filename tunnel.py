@@ -1,136 +1,212 @@
+# server.py
 import socket
 import threading
 import queue
+import time
 
-
-class Tunnel:
-    def __init__(self, host="0.0.0.0", port=10000):
-        self.host = host
-        self.port = port
+class TunnelServer:
+    def __init__(self):
+        self.host = "0.0.0.0"
+        self.port = 10000
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind((self.host, self.port))
-        self.server.listen(20)
+        self.server.listen(5)
 
-        self.tunnel_conn = None
-        self.lock = threading.Lock()
-        self.client_queues = queue.Queue()  # Queue of (request_data, response_queue)
+        # Support multiple tunnels (list of tunnel sessions)
+        self.tunnels = []
+        self.tunnels_lock = threading.Lock()
 
-    def start(self):
-        print(f"Tunnel server listening on {self.host}:{self.port}")
+        # Round robin index
+        self.tunnel_index = 0
+
+        # Start health check thread
+        threading.Thread(target=self.health_check_tunnels, daemon=True).start()
+
+    def handle_request(self):
+        print(f"[Server] Listening on {self.host}:{self.port}")
         try:
             while True:
                 conn, addr = self.server.accept()
-                print(f"Connection received from {addr}")
-                threading.Thread(target=self.handle_connection, args=(conn,), daemon=True).start()
+                print(f"[Server] Connection from {addr}")
+
+                threading.Thread(target=self.dispatch_connection, args=(conn,), daemon=True).start()
         except Exception as e:
-            print(f"Server error: {e}")
+            print(f"[Server error]: {e}")
         finally:
             self.server.close()
 
-    def handle_connection(self, conn):
+    def dispatch_connection(self, conn):
         try:
-            data = conn.recv(4096)
+            data = conn.recv(1024)
             if not data:
                 conn.close()
                 return
 
-            request_line = data.decode(errors="ignore").split("\r\n")[0]
-            if not request_line:
+            first_line = data.decode(errors='ignore').split()
+            if len(first_line) < 2:
                 conn.close()
                 return
 
-            path = request_line.split()[1]
+            path = first_line[1]
+            print(path)
             if path == "/register":
-                threading.Thread(target=self.handle_tunnel, args=(conn,), daemon=True).start()
+                self.handle_tunnel(conn)
             else:
-                threading.Thread(target=self.handle_client, args=(conn, data), daemon=True).start()
+                self.handle_client(conn, data)
         except Exception as e:
-            print(f"Handle connection error: {e}")
+            print(f"[Dispatch error]: {e}")
             conn.close()
 
     def handle_tunnel(self, conn):
-        print("[Tunnel] Registered")
         try:
-            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n Tunnel connected\n")
-            self.tunnel_conn = conn
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\nTunnel registered\n")
+
+            # Register tunnel
+            send_queue = queue.Queue()
+            recv_queue = queue.Queue()
+
+            with self.tunnels_lock:
+                self.tunnels.append({'conn': conn, 'send_q': send_queue, 'recv_q': recv_queue})
+                print(f"[Server] Tunnel registered. Total tunnels: {len(self.tunnels)}")
 
             while True:
-                req_data, response_queue = self.client_queues.get()
+                # Wait for request from user
+                request_data = send_queue.get()
 
-                # Send request to the tunnel client
-                conn.sendall(req_data)
+                # Send request to tunnel client
+                conn.sendall(request_data)
 
-                # Read full response (headers + body) and forward to response_queue
-                response = b""
-                while b"\r\n\r\n" not in response:
-                    chunk = conn.recv(1024)
-                    if not chunk:
-                        raise Exception("Tunnel disconnected while reading headers")
-                    response += chunk
+                # Receive full response from tunnel client
+                full_response = self.recv_full_http_response(conn)
 
-                headers, body_start = response.split(b"\r\n\r\n", 1)
-                response_queue.put(headers + b"\r\n\r\n")
+                # Put response into queue to send back to user
+                recv_queue.put(full_response)
 
-                headers_text = headers.decode(errors="ignore").lower()
-                if "transfer-encoding: chunked" in headers_text:
-                    # Handle chunked response
-                    while True:
-                        chunk = conn.recv(4096)
-                        if not chunk:
-                            break
-                        response_queue.put(chunk)
-                        if b"0\r\n\r\n" in chunk:
-                            break
-                else:
-                    # Handle Content-Length
-                    content_length = 0
-                    for line in headers_text.split("\r\n"):
-                        if line.startswith("content-length:"):
-                            content_length = int(line.split(":")[1].strip())
-                            break
-
-                    received = len(body_start)
-                    if body_start:
-                        response_queue.put(body_start)
-
-                    while received < content_length:
-                        chunk = conn.recv(min(8192, content_length - received))
-                        if not chunk:
-                            break
-                        received += len(chunk)
-                        response_queue.put(chunk)
-
-                response_queue.put(None)  # End of response
         except Exception as e:
-            print(f"[Tunnel] Error: {e}")
+            print(f"[Tunnel error]: {e}")
+
         finally:
-            self.tunnel_conn = None
+            self.remove_tunnel(conn)
             conn.close()
+
+    def get_next_tunnel(self):
+        """Round-robin tunnel selector"""
+        with self.tunnels_lock:
+            if not self.tunnels:
+                return None
+            tunnel = self.tunnels[self.tunnel_index % len(self.tunnels)]
+            self.tunnel_index = (self.tunnel_index + 1) % len(self.tunnels)
+            return tunnel
 
     def handle_client(self, conn, initial_data):
-        print("[Client] Handling request")
-        response_queue = queue.Queue()
         try:
-            if not self.tunnel_conn:
-                conn.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\r\nTunnel Not Connected")
-                conn.close()
+            tunnel = None
+            max_wait = 5  # seconds
+            waited = 0
+            interval = 0.1  # check every 100 ms
+
+            while waited < max_wait:
+                tunnel = self.get_next_tunnel()
+                if tunnel:
+                    break
+                time.sleep(interval)
+                waited += interval
+
+            if tunnel is None:
+                # No tunnel available after waiting, send error
+                error_message = (
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 18\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "No tunnel is open"
+                ).encode()
+                conn.sendall(error_message)
                 return
 
-            # Send to tunnel and wait for response
-            self.client_queues.put((initial_data, response_queue))
+            # Send user request to tunnel
+            tunnel['send_q'].put(initial_data)
 
-            while True:
-                chunk = response_queue.get()
-                if chunk is None:
-                    break
-                conn.sendall(chunk)
+            # Get response from tunnel
+            response = tunnel['recv_q'].get()
+
+            # Send response back to user
+            conn.sendall(response)
+
         except Exception as e:
-            print(f"[Client] Error: {e}")
+            print(f"[Client error]: {e}")
+
         finally:
             conn.close()
 
+    def recv_full_http_response(self, conn):
+        """
+        Receive full HTTP response from tunnel client (headers + body)
+        Handles images, videos, etc. properly
+        """
+        buffer = b''
+        headers_done = False
+        content_length = None
+
+        # Step 1: Read headers
+        while not headers_done:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            if b'\r\n\r\n' in buffer:
+                headers_done = True
+
+        if not headers_done:
+            return buffer  # Return whatever we got
+
+        headers, body = buffer.split(b'\r\n\r\n', 1)
+
+        # Step 2: Parse Content-Length (if present)
+        for line in headers.split(b'\r\n'):
+            if b'Content-Length:' in line:
+                try:
+                    content_length = int(line.split(b':')[1].strip())
+                except ValueError:
+                    content_length = None
+                break
+
+        # Step 3: Read body fully
+        while content_length is not None and len(body) < content_length:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+
+        full_response = headers + b'\r\n\r\n' + body
+        return full_response
+
+    def health_check_tunnels(self):
+        """Periodically check and remove dead tunnels"""
+        while True:
+            time.sleep(5)  # check every 5 seconds
+            with self.tunnels_lock:
+                to_remove = []
+                for tunnel in self.tunnels:
+                    conn = tunnel['conn']
+                    try:
+                        conn.settimeout(0.1)
+                        conn.send(b'')  # Send empty bytes to check
+                        conn.settimeout(None)
+                    except:
+                        to_remove.append(conn)
+                for dead_conn in to_remove:
+                    print("[HealthCheck] Removing dead tunnel")
+                    self.remove_tunnel(dead_conn)
+
+    def remove_tunnel(self, conn):
+        """Safely remove tunnel"""
+        with self.tunnels_lock:
+            self.tunnels = [t for t in self.tunnels if t['conn'] != conn]
+            print(f"[Server] Tunnel removed. Total tunnels: {len(self.tunnels)}")
 
 if __name__ == "__main__":
-    tunnel = Tunnel()
-    tunnel.start()
+    server = TunnelServer()
+    server.handle_request()
